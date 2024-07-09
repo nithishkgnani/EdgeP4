@@ -1,0 +1,41 @@
+{
+  "tables": {
+    "ingress::mac_exact": {
+      "rules": [
+        {
+          "name": "p0_to_p1",
+          "match": {
+            "standard_metadata.ingress_port": {
+              "value": "p0"
+            }
+          },
+          "action": {
+            "type": "ingress::mac_forward",
+            "data": {
+              "port": {
+                "value": "p1"
+              }
+            }
+          }
+        },
+        {
+          "name": "p1_to_p0",
+          "match": {
+            "standard_metadata.ingress_port": {
+              "value": "p1"
+            }
+          },
+          "action": {
+            "type": "ingress::mac_forward",
+            "data": {
+              "port": {
+                "value": "p0"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+  
+}

@@ -195,17 +195,8 @@ HDCallbackCode HDCALLBACK FForceCallback(void *pUserData)
 
         forceMag = hduVecMagnitude(forceDirection);
 
-        if (penetrationDistanceX > 50 || penetrationDistanceY > 50 || penetrationDistanceZ > 50 || penetrationDistanceX < -50 || penetrationDistanceY < -10 || penetrationDistanceZ < -50)
-        {
-            // if (forceMag > 5.0) {
-            //     // hduVecScaleInPlace(forceDirection, 5.0/forceMag); // Max Force
-            //     hduVecScaleInPlace(forceDirection, 5.0); // Max Force
-            // }
-            // printf("ForceMag, Force = %5.3lf %5.3lf %5.3lf %5.3lf\n",
-            //     forceMag, forceDirection[0], forceDirection[1], forceDirection[2]);
+        hdSetDoublev(HD_CURRENT_FORCE, forceDirection); // Actual 
 
-            hdSetDoublev(HD_CURRENT_FORCE, forceDirection); // Actual ACTIVATION/APPLICATION of FORCE
-        }
         /* Copy the position into our device_data tructure.
                 And set the force values */
     }
@@ -315,9 +306,6 @@ void mainLoop()
         payload_send_msg.GTPosition[0] = __builtin_bswap16((u_int16_t)x_send);
         payload_send_msg.GTPosition[1] = __builtin_bswap16((u_int16_t)y_send);
         payload_send_msg.GTPosition[2] = __builtin_bswap16((u_int16_t)z_send);
-        // payload_send_msg.GTPosition[0] = currentData.m_devicePosition[0];
-        // payload_send_msg.GTPosition[1] = currentData.m_devicePosition[1] + 65.5107;
-        // payload_send_msg.GTPosition[2] = currentData.m_devicePosition[2] + 88.1142;
         payload_send_msg.ButtonState[0] = __builtin_bswap16(currentData.m_buttonState_1);
         payload_send_msg.ButtonState[1] = __builtin_bswap16(currentData.m_buttonState_2);
 

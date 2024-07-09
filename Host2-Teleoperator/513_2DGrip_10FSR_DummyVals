@@ -1,0 +1,477 @@
+#!/usr/bin/env python
+
+# -- BEGIN LICENSE BLOCK ----------------------------------------------
+# Copyright 2021 FZI Forschungszentrum Informatik
+# Created on behalf of Universal Robots A/S
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# -- END LICENSE BLOCK ------------------------------------------------
+#
+# ---------------------------------------------------------------------
+# !\file
+#
+# \author  Nithish K Gnani
+# \date    2023-04-14
+#
+# SCRIPT DETAILS
+# This script is a basic tele-operation demonstration in which
+# you can move the UR3 robot and open-close gripper by controlling it in
+# real time using a Geomagic Touch
+# It does intelligent grip correction for with dummy-simulated 2*5 fsr array
+# ---------------------------------------------------------------------
+
+import os
+import sys
+import time
+
+import rospy
+import actionlib
+from controller_manager_msgs.srv import SwitchControllerRequest, SwitchController
+from controller_manager_msgs.srv import LoadControllerRequest, LoadController
+import geometry_msgs.msg as geometry_msgs
+from cartesian_control_msgs.msg import (
+    FollowCartesianTrajectoryAction,
+    FollowCartesianTrajectoryGoal,
+    CartesianTrajectoryPoint,
+)
+from sensor_msgs.msg import JointState
+
+
+### imports required to receive Geomagic Touch data
+import communication_python
+from ctypes import *
+import pandas as pd
+# Use select for efficient I/O non-blocking operation socket programming
+# import select
+import timeit
+
+import dummy_fsr_values
+
+### for robotiq gripper serial control
+import serial
+import binascii
+
+import numpy as np
+import itertools
+import math
+from math import atan
+
+### imports done
+
+### Intermediate coordinates maker
+def intermediates(p1, p2, nb_points=8):
+    """"Return a list of nb_points equally spaced points
+    between p1 and p2"""
+    # If we have 8 intermediate points, we have 8+1=9 spaces
+    # between p1 and p2
+    x_spacing = (p2[0] - p1[0]) / (nb_points + 1)
+    y_spacing = (p2[1] - p1[1]) / (nb_points + 1)
+    z_spacing = (p2[2] - p1[2]) / (nb_points + 1)
+
+
+    coord_list = [[p1[0] + i * x_spacing, p1[1] + i * y_spacing, p1[2] + i * z_spacing]
+            for i in range(1, nb_points + 1)]
+
+    pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(p1[0], p1[1], p1[2]), geometry_msgs.Quaternion(qx, qy, qz, qw))]
+    i = 1
+    while (i < len(coord_list)):
+        pose_list.append(geometry_msgs.Pose(geometry_msgs.Vector3(coord_list[i][0], coord_list[i][1], coord_list[i][2]), geometry_msgs.Quaternion(qx, qy, qz, qw)))
+        i = i + 1
+
+    return(pose_list)
+#######
+
+### UR3 code ###
+# Compatibility for python2 and python3
+if sys.version_info[0] < 3:
+    input = raw_input
+
+# If your robot description is created with a tf_prefix, those would have to be adapted
+JOINT_NAMES = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
+# All of those controllers can be used to execute joint-based trajectories.
+# The scaled versions should be preferred over the non-scaled versions.
+JOINT_TRAJECTORY_CONTROLLERS = [
+    "scaled_pos_joint_traj_controller",
+]
+
+# All of those controllers can be used to execute Cartesian trajectories.
+# The scaled versions should be preferred over the non-scaled versions.
+CARTESIAN_TRAJECTORY_CONTROLLERS = [
+    "pose_based_cartesian_traj_controller",
+]
+
+# We'll have to make sure that none of these controllers are running, as they will
+# be conflicting with the joint trajectory controllers
+CONFLICTING_CONTROLLERS = ["joint_group_vel_controller", "twist_controller"]
+
+class gripper_2f85:
+    def __int__(self):
+        counter = 0
+        while counter < 1:
+            counter = counter + 1
+            ser.write("\x09\x10\x03\xE8\x00\x03\x06\x00\x00\x00\x00\x00\x00\x73\x30")
+            time.sleep(0.01)
+            ser.write("\x09\x03\x07\xD0\x00\x01\x85\xCF")
+            time.sleep(0.1)
+
+    def gripper_open(self):
+        ser.write("\x09\x10\x03\xE8\x00\x03\x06\x09\x00\x00\x00\xFF\xFF\x72\x19")
+        # data_raw = ser.readline()
+        # print(data_raw)
+        # data = binascii.hexlify(data_raw)
+        # time.sleep(0.1)
+
+    def gripper_close(self):
+        ser.write("\x09\x10\x03\xE8\x00\x03\x06\x09\x00\x00\xFF\xFF\xFF\x42\x29")
+        # data_raw = ser.readline()
+        # print(data_raw)
+        # data = binascii.hexlify(data_raw)
+        # time.sleep(0.1)
+
+class TrajectoryClient:
+    """Small trajectory client to test a joint trajectory"""
+
+    def __init__(self):
+        rospy.init_node("test_move")
+
+        timeout = rospy.Duration(5)
+        self.switch_srv = rospy.ServiceProxy(
+            "controller_manager/switch_controller", SwitchController
+        )
+        self.load_srv = rospy.ServiceProxy("controller_manager/load_controller", LoadController)
+        try:
+            self.switch_srv.wait_for_service(timeout.to_sec())
+        except rospy.exceptions.ROSException as err:
+            rospy.logerr("Could not reach controller switch service. Msg: {}".format(err))
+            sys.exit(-1)
+
+        self.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[0]
+        self.cartesian_trajectory_controller = CARTESIAN_TRAJECTORY_CONTROLLERS[0]
+
+
+    def send_cartesian_trajectory(self, pose_list, duration_list):
+        """Creates a Cartesian trajectory and sends it using the selected action server"""
+
+        # make sure the correct controller is loaded and activated
+        goal = FollowCartesianTrajectoryGoal()
+        trajectory_client = actionlib.SimpleActionClient(
+            "{}/follow_cartesian_trajectory".format(self.cartesian_trajectory_controller),
+            FollowCartesianTrajectoryAction,
+        )
+
+        # Wait for action server to be ready
+        timeout = rospy.Duration(5)
+        if not trajectory_client.wait_for_server(timeout):
+            rospy.logerr("Could not reach controller action server.")
+            sys.exit(-1)
+
+
+        for i, pose in enumerate(pose_list):
+            point = CartesianTrajectoryPoint()
+            # print(point)
+            point.pose = pose
+            point.time_from_start = rospy.Duration(duration_list[i])
+            goal.trajectory.points.append(point)
+
+
+        trajectory_client.send_goal(goal)
+        trajectory_client.wait_for_result()
+
+        result = trajectory_client.get_result()
+
+        # rospy.loginfo("Trajectory execution finished in state {}".format(result.error_code))
+
+
+    # Method defined below is for the sake of safety   #
+    def switch_controller(self, target_controller):
+        """Activates the desired controller and stops all others from the predefined list above"""
+        other_controllers = (
+            JOINT_TRAJECTORY_CONTROLLERS
+            + CARTESIAN_TRAJECTORY_CONTROLLERS
+            + CONFLICTING_CONTROLLERS
+        )
+
+        other_controllers.remove(target_controller)
+
+        srv = LoadControllerRequest()
+        srv.name = target_controller
+        self.load_srv(srv)
+
+        srv = SwitchControllerRequest()
+        srv.stop_controllers = other_controllers
+        srv.start_controllers = [target_controller]
+        srv.strictness = SwitchControllerRequest.BEST_EFFORT
+        self.switch_srv(srv)
+#### UR3 Code ends ###
+###############################################################################################
+
+### Geomagic UDP_socket_python code ###
+""" Networking """
+# Define sockets - UDP receive socket and destination socket
+ReceiveSocketIP = "10.114.64.248" #"10.0.0.3" #"10.114.64.248"
+ReceiveSocketPort = 18007
+SendToSocketIP = "10.114.64.70" #"10.0.0.2" #"10.114.64.70"
+SendToSocketPort = 18005
+AddressToSendTo = ((SendToSocketIP, SendToSocketPort))
+AddressToRecvAt = ((ReceiveSocketIP, ReceiveSocketPort))
+
+""" This class defines a C-like struct """
+# For sending - Unused in this demo
+class Payload_send(Structure):
+    _fields_ = [("MsgIDfeedback", c_uint32),("Fx", c_float),("Fy", c_float),("Fz", c_float)]
+
+# For receiving
+class Payload_recv(Structure):
+    _fields_ = [("IDs", c_uint32),
+                ("moveDXs", c_float),("moveDYs", c_float),("moveDZs", c_float),
+                # ("angleDXs", c_float),("angleDYs", c_float),("angleDZs", c_float),
+                # ("velDXs", c_float),("velDYs", c_float),("velDZs", c_float),
+                # ("gimbDXs", c_float),("gimbDYs", c_float),("gimbDZs", c_float),
+                ("btn1", c_int8),
+                ("btn2", c_int8)
+                ]
+
+
+""" Script to drive robot with feedback by reading messages
+or without feedback by not reading messages"""
+def PhaseI(commParameters):
+    socketsend = commParameters[0]
+    socketrecv = commParameters[1]
+    try:
+        print("\n\nStart moving the haptic device")
+        #(x, y, z) = (0.0, -0.20, 0.1)
+        (x, y, z) = (-0.00, -0.20, 0.08)
+        angle_deg = 0
+        (qx, qy, qz, qw) = custom_e2q01(angle_deg)
+
+        grip_flag = 0
+        i = 0
+        i_history = -20
+        pos_step = 0.0005
+        dur_gap = pos_step*10
+        x_offset = -0.00
+        z_offset = 0.08
+        while True:
+        # while(i<500):
+            """ Receive block - Receive data at the bound socket data and
+            unpack into receiving data structure """
+            if i - i_history < 10: continue
+            # UDP packet contains message and address from which data received
+            messagerecv, fromaddress = socketrecv.recvfrom(sizeof(Payload_recv))
+            # print("Size received: %d\n" % sys.getsizeof(message))
+            payload_in_msg = Payload_recv.from_buffer_copy(messagerecv)
+            # print("Received - ID=%d, (%f,%f,%f), buttons: (%d, %d)" % (payload_in_msg.IDs, payload_in_msg.moveDXs, payload_in_msg.moveDYs, payload_in_msg.moveDZs, payload_in_msg.btn1, payload_in_msg.btn2))
+
+
+            xt = x_offset + payload_in_msg.moveDXs / 1000
+            yt = -0.20 - payload_in_msg.moveDZs / 1000 # * 15 / 18
+            zt = z_offset + (payload_in_msg.moveDYs) / 1000 # * 2.0 / 3.16
+
+            if zt<0.01:
+                zt=0.01
+
+            ## UR3 control
+            # if i % 2 == 0:
+            if abs(x - xt) > 0.001 or abs(y - yt) > 0.001 or abs(z - zt) > 0.001:
+                # print("Loop No. ", i + 1, "messageID: ", payload_in_msg.IDs)
+                list_coord_beg = [x, y, z]
+                list_coord_end = [xt, yt, zt]
+
+                # pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x, y, z), geometry_msgs.Quaternion(qx, qy, qz, qw))]
+                nb_points = abs(int((y - yt)/pos_step))
+                pose_list = intermediates(list_coord_beg, list_coord_end, nb_points)
+                timestamp = dur_gap
+                duration_list = []
+                for iter in range(len(pose_list)):
+                    duration_list.append(timestamp)
+                    timestamp = timestamp + dur_gap
+
+                x = xt
+                y = yt
+                z = zt
+
+                client.send_cartesian_trajectory(pose_list, duration_list)
+
+            bt1t = payload_in_msg.btn1
+            bt2t = payload_in_msg.btn2
+            threshold = 500
+            """ gripper manipulation based on user input at haptic device """
+            #####################################################################################
+            if bt1t > 0 and bt2t > 0: continue
+            if bt1t > 0 and grip_flag==1:
+                gripping = 1
+                gripper.gripper_close()
+                time.sleep(1.5)  # Time for the gripper to completely close
+                grip_flag=0
+                ### Start reading arduino
+                thresh = 500
+                print("Sensor_Read")
+                data_spl = dummy_fsr_values.random_reading(thresh)  # Getting a list of dummy simulated reading
+                print(data_spl)
+
+                i = 0
+                j = 0
+                for i in range(0, 10):
+                    if data_spl[i] > thresh:
+                        break
+                for j in range(9, -1, -1):
+                    if data_spl[j] > thresh:
+                        break
+                if j <= i:
+                    # print("No grip--->>> ", i,j)
+                    continue  ### If there are only 0 or 1 sensors crossing threshold, continue to next iteration
+
+                high_fsrs = str(i) + str(j)
+                coords_list = []  # clearingit to avoid infinite loop
+                # print(end_coords)
+                correction = correction_out(high_fsrs)
+                # print("Correction: ", correction)
+                if correction == None:
+                    print("Bad grip !!!")
+                    continue
+                correction = list(map(float, correction))  # Convert the elements to float from string
+
+                fsr_dist = 0.0007
+
+                print("FSRs: " + high_fsrs + ", vertical_steps: " + str(
+                    correction[0]) + " , horizontal_steps: " + str(correction[1]) + " , qx: " + str(
+                    correction[2]) + " , qy: " + str(correction[3]) + " , qz: " + str(
+                    correction[4]) + " , qw: " + str(correction[5]))
+                # print("Initial position:", x, y, z)
+                (x2, y2, z2) = (x + correction[1] * fsr_dist, y, z + correction[0] * fsr_dist)
+                print("Corrected position: ", x2, y2, z2)
+                (qx2, qy2, qz2, qw2) = (correction[2], correction[3], correction[4], correction[5])
+                print("Correction quats  : ", qx2, qy2, qz2, qw2)
+
+                # print("---------")
+                #
+                gripper.gripper_open()
+                print("gripper_open")
+                time.sleep(1.0)
+
+                # pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x, y, z), geometry_msgs.Quaternion(qx, qy, qz, qw))]  # move to GT's position
+                # client.send_cartesian_trajectory(pose_list, [2])
+                pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x2, y2, z2),
+                                                geometry_msgs.Quaternion(qx2, qy2, qz2, qw2))]  # move to new pos
+                client.send_cartesian_trajectory(pose_list, [2])
+
+                gripper.gripper_close()
+                print("gripper_close")
+                time.sleep(1.5)
+
+                pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x, y, z),
+                                                geometry_msgs.Quaternion(qx, qy, qz, qw))]  # move to GT's position
+                client.send_cartesian_trajectory(pose_list, [2])
+                print("Grip correction done")
+                gripping = 0
+
+            if bt2t > 0:
+                gripper.gripper_open()
+                grip_flag=1
+            #####################################################################################
+
+            i = i + 1
+            ### UR3 control ends
+
+    except KeyboardInterrupt:
+        print("\nExiting.....")
+        communication_python.cleanUpComms(socketrecv)
+        sys.exit(0)
+### Geomagic code ends
+###############################################################################################
+pos_step = 0.015
+
+def dummy_fun(temp):
+    end_coords = temp
+    correction = correction_out(end_coords)
+    correction = list(map(float, correction))  # Convert the elements to float form string
+    print("vertical_steps: "+str(correction[0])+"   , horizontal_steps: "+str(correction[1])+"   , angle: "+str(correction[2]))
+    fsr_dist = 0.0007
+    (x, y, z) = (0.1, 0.1, 0.1)
+    print(x, y, z)
+    (x, y, z) = (x, y + correction[1] * fsr_dist, z + correction[0] * fsr_dist)
+    print(x, y, z)
+    quats = e2q(0, 0, (180 + correction[2]) * math.pi / 180)
+    (qx, qy, qz, qw) = (quats[0], quats[1], quats[2], quats[3])
+    print(qx, qy, qz, qw)
+
+### function to load the sensor to output table and store as dictionary
+def array_out_load():
+    df_out = pd.read_csv("/home/zenlab/catkin_ws/src/Universal_Robots_ROS_Driver/ur_robot_driver/scripts/array_out_03.csv",
+                         dtype=str)  # used dtype=str to ensure 0011 is not imported as 11 (float64 default conversion)
+    df_out = df_out.drop(df_out.columns[0], axis=1)  # dropping zeroth column (index)
+    df_out.drop(['x1', 'y1', 'x2', 'y2', 'key' ,'fsr1', 'fsr2','angle'], axis=1, inplace=True)  # dropping unwanted columns
+    match_dict = df_out.set_index('key_fsr').T.to_dict('list')  # Converting to dictionary
+    return (match_dict)
+
+def correction_out(high_fsrs):
+    key_to_search = str(high_fsrs)
+    # print(key_to_search)
+    correction = match_dict.get(key_to_search)  # getting the correction values using get method in dictionary
+    return(correction)
+
+### Defining a custom fuction to convert Euler Angles to Quaternion
+### This works only on the plane parallel to the whiteboard
+def custom_e2q01(angle_deg):
+    qx = 0.707106781
+    qy = qx
+    qz = float(angle_deg)/90*qx
+    qw = qz
+    return (qx,qy,qz,qw)
+
+
+if __name__ == "__main__":
+    client = TrajectoryClient()
+    client.switch_controller(client.cartesian_trajectory_controller)
+    # print(sys.version)
+    match_dict = array_out_load()  # load array_out table to match_dict dictionary
+
+    gripper = gripper_2f85()
+
+    # Initial position
+    (x, y, z) = (-0.00, -0.20, 0.08)
+    angle_deg = 0
+    (qx, qy, qz, qw) = custom_e2q01(angle_deg)
+    pos_step = 0.010
+    dur= 0.20   #0.25
+    duration_list = [dur]
+
+    print("Inititalizing...")
+
+    ### Gripper serial communication ###
+    ser = serial.Serial(port='/dev/ttyUSB0', baudrate=115200, timeout=1, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, bytesize=serial.EIGHTBITS)
+
+    pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x, y, z), geometry_msgs.Quaternion(qx, qy, qz, qw))]  # initial position
+    client.send_cartesian_trajectory(pose_list, [1.5])
+
+    pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x+pos_step, y-0, z+pos_step), geometry_msgs.Quaternion(qx, qy, qz, qw))]  # move to position
+    client.send_cartesian_trajectory(pose_list, duration_list)
+
+    pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(x, y, z), geometry_msgs.Quaternion(qx, qy, qz, qw))]  # initial position
+    client.send_cartesian_trajectory(pose_list, duration_list)
+
+    gripper.gripper_open()
+    time.sleep(1)
+
+    print("Done initializing")
+
+    commParameters = communication_python.Comm(AddressToRecvAt, AddressToSendTo)
+    PhaseI(commParameters)
