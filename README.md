@@ -4,7 +4,7 @@
 * [Best paper award](media/BestPaperAward.jpg)  
 
 ## Authors
-Nithish K Gnani, Joydeep Pal, Deepak Choudhary, Himanshu V, Soumya R, Kaushal M, T V Prabhakar, Chandramani Singh  
+[Nithish K Gnani](https://github.com/nithishkgnani), [Joydeep Pal](https://github.com/joygetsit), [Deepak Choudhary](https://github.com/deepakc7y), Himanshu V, Soumya R, Kaushal M, T V Prabhakar, Chandramani Singh  
 
 ## Cyber-Pysical System Testbed
 
