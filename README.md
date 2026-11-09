@@ -20,6 +20,12 @@ The devices run the code found in the following directories:
 
 Connect Geomagic Touch on one of the ports of the SmartNIC and UR3 on the other port. Update the match action json file accordingly.
 
+
+### Custom Gripper
+
+The CAD files of the custom gripper built for this project can be found in the
+ [Gripper-CAD](Gripper-CAD) folder. 
+
 ## Communication Setup
 
 Go to the relevant folder for wither pose correction or tremor suppression and execute the commands in the following order:
